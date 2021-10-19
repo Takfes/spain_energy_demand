@@ -76,6 +76,9 @@ energy %>% select(time,starts_with('price_')) %>%
 forecast_steps <- 24
 target_variable <- 'price_actual'
 time_variable <- 'time'
+ma_features <- seq(0,12,3)[-1]
+fourier_periods <- c(1,12,24)
+fourier_orders <- 2
 raw_predictor_names <- energy %>% select(starts_with('generation')) %>% names()
 
 # determine cycles
@@ -84,6 +87,66 @@ time_max <- energy %>% pull(time) %>% max()
 time_dts <- energy %>% pull(time) %>% n_distinct()
 cycles <- seq(time_min,length.out = time_dts, by='hour') %>% data.frame(cycle_time = .)
 assert_that(cycles %>% nrow == time_dts)
+
+# prepare calendar
+calendar <- 1:forecast_steps %>%
+  map_df(~ cycles  %>% 
+           mutate(
+             step = .x,
+             target_time = cycle_time + hours(step-1))
+  ) %>% 
+  tk_augment_timeseries_signature(target_time) %>%
+  select(cycle_time,step,target_time,
+         half,quarter,month,day,hour,am.pm,wday,mday,qday,yday,mweek,week) %>% 
+  arrange(cycle_time,step)
+
+assert_that(calendar %>% nrow == cycles %>% nrow * forecast_steps)
+calendar %>% dim()
+calendar %>% names()
+
+
+# prepare fourier features
+fcalendar <- calendar %>% 
+  select(target_time) %>% 
+  distinct() %>% 
+  tk_augment_fourier(target_time, .period = fourier_periods, .K = fourier_orders)
+
+fcalendar %>% dim()
+fcalendar %>% names()
+
+
+# prepare predictors timetk
+predictors_H <- energy %>% 
+  select(time_variable,raw_predictor_names) %>%
+  tk_augment_lags(.value = all_of(raw_predictor_names),
+                  .lags = 1) %>% 
+  tk_augment_slidify(.value   = ends_with("lag1"),
+                     .period  = ma_features,
+                     .f       = mean,
+                     .align   = 'right', 
+                     .partial = TRUE
+  ) %>% 
+  select(-raw_predictor_names) %>% 
+  rename(cycle_time = time)
+
+predictors_H %>% dim()
+predictors_H %>% names()
+
+
+# join dataframes
+modeldata <- calendar %>% 
+  merge(fcalendar) %>% 
+  merge(predictors_H)
+
+calendar %>% dim()
+modeldata %>% dim()
+modeldata %>% names()
+modeldata %>% isna()
+modeldata %>% clopy()
+
+
+modeldata %>% write_csv('modeldata.csv')
+
 
 
 # prepare predictors using recipes
@@ -101,24 +164,12 @@ rec_prep <- rec_obj %>% prep()
 rec_prep %>% juice() %>% names()
 
 
-# prepare predictors timetk
-predictors <- energy %>% 
-  select(time,starts_with('generation')) %>%
-  tk_augment_lags(.value = starts_with("generation"),
-                  .lags = 1) %>% 
-  tk_augment_slidify(.value   = ends_with("lag1"),
-                     .period  = seq(0,24,3)[-1],
-                     .f       = mean,
-                     .align   = 'right', 
-                     .partial = TRUE
-                     ) %>% 
-  select(-raw_predictor_names)
-
 # prepare predictors mutate across
 energy %>% 
   select(contains('biomass')) %>% 
   mutate(across(starts_with('generation'),
                 list(lag01 = lag, lag02 = ~lag(.,2))))
+
 
 # prepare predictors mutate at
 energy %>% 
@@ -129,58 +180,18 @@ energy %>%
             funs(ra_3 = rollmean(., k = 3, align = 'right', fill = NA)))
 
 
-# EXAMPLE
-# dummy dataframe
-n <- 10
-set.seed(123)
-foo <- data.frame(
-  date = seq(as.Date('2020-01-01'),length.out = n, by = 'day'),
-  var1 = sample.int(n),
-  var2 = sample.int(n))
-# create lags and based on (some of) them create rolling average features
-foo %>% 
-  mutate_at(vars(starts_with('var')),
-            funs(lag_1 = lag(.), lag_2 = lag(.,2))) %>% 
-  mutate_at(vars(contains('lag_1')),
-            funs(ra_3 = rollmean(., k = 3, align = 'right', fill = NA)))
-
-foo %>% 
-  select(date,starts_with('var')) %>%
-  tk_augment_lags(.value = starts_with("var"),
-                  .lags = 1) %>% 
-  tk_augment_slidify(.value   = ends_with("lag1"),
-                     .period  = seq(0,24,3)[-1],
-                     .f       = mean,
-                     .align   = 'right', 
-                     .partial = TRUE
-  )
-
-
-
-
-# prepare calendar
-calendar <- 1:forecast_steps %>%
-  map_df(~ cycles  %>% 
-           mutate(
-             step = .x,
-             target_time = cycle_time + hours(step-1))
-         ) %>% 
-  arrange(cycle_time,step)
-assert_that(calendar %>% nrow == cycles %>% nrow * forecast_steps)
-
-
-# prepare dataframe
-df <- calendar %>%
-  tk_augment_timeseries_signature(target_time) %>%
-  select(cycle_time,step,target_time,
-         half,quarter,month,day,hour,am.pm,wday,mday,qday,yday,mweek,week) %>% 
-  left_join(energy_nna %>% select(time,price_actual), by = c('target_time'  = 'time')) %>% 
-  left_join(energy_nna %>% select(time,starts_with('generation')), by = c('cycle_time' = 'time')) %>% 
-  janitor::clean_names() %>% 
-  select(cycle_time,step,target_time,target_variable,everything(),starts_with('generation'))
-
-df %>% names()
-df %>% isna()
+# # prepare dataframe
+# df <- calendar %>%
+#   tk_augment_timeseries_signature(target_time) %>%
+#   select(cycle_time,step,target_time,
+#          half,quarter,month,day,hour,am.pm,wday,mday,qday,yday,mweek,week) %>% 
+#   left_join(energy_nna %>% select(time,price_actual), by = c('target_time'  = 'time')) %>% 
+#   left_join(energy_nna %>% select(time,starts_with('generation')), by = c('cycle_time' = 'time')) %>% 
+#   janitor::clean_names() %>% 
+#   select(cycle_time,step,target_time,target_variable,everything(),starts_with('generation'))
+# 
+# df %>% names()
+# df %>% isna()
 
 
 
