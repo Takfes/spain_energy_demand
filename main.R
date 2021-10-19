@@ -10,6 +10,8 @@
 
 # Libraries ---------------------------------------------------------------
 
+rm(list=ls())
+
 # install.packages('tidymodels')
 # devtools::install_github('Takfes/takmeR')
 
@@ -18,71 +20,145 @@ pacman::p_load(tidyverse,tidymodels,skimr,modeltime,lubridate,assertthat,
 
 # Files -------------------------------------------------------------------
 
-weather <- fread('weather_features.csv') %>% 
+weather_raw <- fread('weather_features.csv') %>% 
   janitor::clean_names()
 
-energy <- fread('energy_dataset.csv') %>% 
+energy_raw <- fread('energy_dataset.csv') %>% 
   select_if(~!is.logical(.)) %>%
   janitor::clean_names() 
 
 # Impute missing ----------------------------------------------------------
 
-energy %>% isna()
+energy_raw %>% isna()
 
-energy_na1 <- energy %>% 
+energy1 <- energy_raw %>% 
   mutate_if(~any(is.na(.)),~na.spline(.)) %>% 
   setNames(paste0('imp_',names(.))) %>% 
-  bind_cols(energy)
+  bind_cols(energy_raw)
 
-energy_na2 <- energy %>% 
+energy2 <- energy_raw %>% 
   mutate_if(~any(is.na(.)),~na.approx(.)) %>% 
   setNames(paste0('imp_',names(.))) %>% 
-  bind_cols(energy)
+  bind_cols(energy_raw)
 
-energy_na1 %>%
+energy1 %>%
   select(time, contains('generation')) %>%
   pivot_longer(-time, names_to = 'variable') %>% 
   mutate(imputed = grepl('^imp', variable),
          variable = str_replace(variable,'^imp_','')) %>% 
   ggplot() + aes(x=time,y=value,color = imputed) + geom_line() + facet_grid(variable~.,scales = 'free')
 
-energy_nna <- energy %>% 
+energy <- energy_raw %>% 
   mutate_if(~any(is.na(.)),~na.spline(.))
 
-energy_nna %>% isna() %>% sum()
+energy %>% isna() %>% sum()
 
 # Visualizations ----------------------------------------------------------
 
-energy_nna %>% 
+energy %>% 
   select(time,starts_with("generation")) %>%
   pivot_longer(cols = starts_with('generation_'), names_to = 'variable') %>% 
   ggplot() + aes(x=time,y=value) + geom_line() + facet_grid(variable~., scales='free')
   
-energy_nna %>% 
+energy %>% 
   select(time,starts_with("generation")) %>%
   pivot_longer(cols = starts_with('generation'), names_to = 'variable') %>% 
   ggplot() + aes(x=value,fill=variable) + geom_density() + facet_grid(variable~., scales='free')
 
-energy_nna %>% select(time,starts_with('price_')) %>% 
+energy %>% select(time,starts_with('price_')) %>% 
   pivot_longer(cols = -c(time), names_to = 'variable') %>% 
   ggplot() + aes(x=time,y=value,color = variable) + geom_line()
 
 
 # Forecast Dataset --------------------------------------------------------
 
+# settings
 forecast_steps <- 24
 target_variable <- 'price_actual'
+time_variable <- 'time'
+raw_predictor_names <- energy %>% select(starts_with('generation')) %>% names()
 
-time_min <- energy_nna %>% pull(time) %>% min()
-time_max <- energy_nna %>% pull(time) %>% max()
-time_dts <- energy_nna %>% pull(time) %>% n_distinct()
-
-# cycles <- seq(time_min,length.out = time_dts + forecast_steps, by='hour') %>% data.frame(cycle_time = .)
-# assert_that(cycles %>% nrow == time_dts + forecast_steps)
-
+# determine cycles
+time_min <- energy %>% pull(time) %>% min()
+time_max <- energy %>% pull(time) %>% max()
+time_dts <- energy %>% pull(time) %>% n_distinct()
 cycles <- seq(time_min,length.out = time_dts, by='hour') %>% data.frame(cycle_time = .)
 assert_that(cycles %>% nrow == time_dts)
 
+
+# prepare predictors using recipes
+boo <- energy %>% select(time_variable,target_variable,starts_with('generation'))
+
+rec_obj <- recipe(data = boo, as.formula(paste(target_variable,"~."))) %>% 
+  update_role('time', new_role = 'id_column') %>% 
+  step_lag(contains('generation'),lag = 1) %>% 
+  step_slidify_augment(starts_with('lag_1_'),period = c(3,6,9,12), align = 'right', .f='mean')
+  
+  # step_slidify(starts_with('lag_1_'),period = c(3,6), align = 'right', .f='mean', 
+  #              names = paste0("ra3_", rec_prep$template %>% select(starts_with('lag_1_')) %>% names()), f_name='rolling_average')
+
+rec_prep <- rec_obj %>% prep()
+rec_prep %>% juice() %>% names()
+
+
+# prepare predictors timetk
+predictors <- energy %>% 
+  select(time,starts_with('generation')) %>%
+  tk_augment_lags(.value = starts_with("generation"),
+                  .lags = 1) %>% 
+  tk_augment_slidify(.value   = ends_with("lag1"),
+                     .period  = seq(0,24,3)[-1],
+                     .f       = mean,
+                     .align   = 'right', 
+                     .partial = TRUE
+                     ) %>% 
+  select(-raw_predictor_names)
+
+# prepare predictors mutate across
+energy %>% 
+  select(contains('biomass')) %>% 
+  mutate(across(starts_with('generation'),
+                list(lag01 = lag, lag02 = ~lag(.,2))))
+
+# prepare predictors mutate at
+energy %>% 
+  select(contains('biomass')) %>% 
+  mutate_at(vars(starts_with('generation')),
+            funs(lag_1 = lag(.), lag_2 = lag(.,2))) %>% 
+  mutate_at(vars(contains('lag_1')),
+            funs(ra_3 = rollmean(., k = 3, align = 'right', fill = NA)))
+
+
+# EXAMPLE
+# dummy dataframe
+n <- 10
+set.seed(123)
+foo <- data.frame(
+  date = seq(as.Date('2020-01-01'),length.out = n, by = 'day'),
+  var1 = sample.int(n),
+  var2 = sample.int(n))
+# create lags and based on (some of) them create rolling average features
+foo %>% 
+  mutate_at(vars(starts_with('var')),
+            funs(lag_1 = lag(.), lag_2 = lag(.,2))) %>% 
+  mutate_at(vars(contains('lag_1')),
+            funs(ra_3 = rollmean(., k = 3, align = 'right', fill = NA)))
+
+foo %>% 
+  select(date,starts_with('var')) %>%
+  tk_augment_lags(.value = starts_with("var"),
+                  .lags = 1) %>% 
+  tk_augment_slidify(.value   = ends_with("lag1"),
+                     .period  = seq(0,24,3)[-1],
+                     .f       = mean,
+                     .align   = 'right', 
+                     .partial = TRUE
+  )
+
+
+
+
+# prepare calendar
 calendar <- 1:forecast_steps %>%
   map_df(~ cycles  %>% 
            mutate(
@@ -92,6 +168,8 @@ calendar <- 1:forecast_steps %>%
   arrange(cycle_time,step)
 assert_that(calendar %>% nrow == cycles %>% nrow * forecast_steps)
 
+
+# prepare dataframe
 df <- calendar %>%
   tk_augment_timeseries_signature(target_time) %>%
   select(cycle_time,step,target_time,
